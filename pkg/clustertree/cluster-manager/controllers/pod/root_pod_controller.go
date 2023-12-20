@@ -2,11 +2,14 @@ package pod
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"reflect"
+	"strconv"
 	"strings"
 	"time"
 
+	authenticationv1 "k8s.io/api/authentication/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -17,6 +20,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/klog/v2"
+	"k8s.io/kubernetes/pkg/serviceaccount"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -365,63 +369,41 @@ func (r *RootPodReconciler) createSAInLeafCluster(ctx context.Context, lr *leafU
 	return newSA, nil
 }
 
-func (r *RootPodReconciler) createSATokenInLeafCluster(ctx context.Context, lr *leafUtils.LeafResource, saName string, ns string) (*corev1.Secret, error) {
-	satokenKey := types.NamespacedName{
-		Namespace: ns,
-		Name:      saName,
-	}
-	sa := &corev1.ServiceAccount{}
-	err := r.RootClient.Get(ctx, satokenKey, sa)
+func (r *RootPodReconciler) createSATokenInLeafCluster(ctx context.Context, lr *leafUtils.LeafResource, saName string, ns string, ExpirationSeconds *int64, BoundObjectReference *authenticationv1.BoundObjectReference) (*corev1.Secret, error) {
+	// create token
+	token, err := utils.CreateToken(lr.Clientset, ns, saName, ExpirationSeconds, BoundObjectReference)
 	if err != nil {
-		return nil, fmt.Errorf("could not find sa %s in master cluster: %v", saName, err)
+		return nil, err
 	}
 
-	var secretName string
-	if len(sa.Secrets) > 0 {
-		secretName = sa.Secrets[0].Name
-	}
-
-	csName := fmt.Sprintf("master-%s-token", sa.Name)
-	csKey := types.NamespacedName{
-		Namespace: ns,
-		Name:      csName,
-	}
-	clientSecret := &corev1.Secret{}
-	err = lr.Client.Get(ctx, csKey, clientSecret)
-	if err != nil && !errors.IsNotFound(err) {
-		return nil, fmt.Errorf("could not check secret %s in member cluster: %v", secretName, err)
-	}
-	if err == nil {
-		return clientSecret, nil
-	}
-
-	secretKey := types.NamespacedName{
-		Namespace: ns,
-		Name:      secretName,
-	}
-
-	masterSecret := &corev1.Secret{}
-	err = r.RootClient.Get(ctx, secretKey, masterSecret)
+	secretName := fmt.Sprintf("satoken-%s", BoundObjectReference.Name)
+	tokenByte, err := base64.StdEncoding.DecodeString(token.Status.Token)
 	if err != nil {
-		return nil, fmt.Errorf("could not find secret %s in master cluster: %v", secretName, err)
+		return nil, fmt.Errorf("could not decode token to byte: %v", err)
+	}
+	tokenData := map[string][]byte{
+		"token": tokenByte,
 	}
 
-	nData := map[string][]byte{}
-	nData["token"] = masterSecret.Data["token"]
-
-	newSE := &corev1.Secret{
+	saToken := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      csName,
+			Name:      secretName,
 			Namespace: ns,
+			Annotations: map[string]string{
+				"ExpirationTimestamp":  token.Status.ExpirationTimestamp.String(),
+				"BoundObjectReference": BoundObjectReference.String(),
+				"saName":               saName,
+				"ExpirationSeconds":    strconv.FormatInt(*ExpirationSeconds, 10),
+			},
 		},
-		Data: nData,
+		Data: tokenData,
 	}
-	err = lr.Client.Create(ctx, newSE)
+	err = lr.Client.Create(ctx, saToken)
 
-	if err != nil && !errors.IsAlreadyExists(err) {
-		return nil, fmt.Errorf("could not create sa %s in member cluster: %v", sa, err)
+	if err != nil {
+		return nil, fmt.Errorf("could not create Secret-serviceAccountToken %s in member cluster: %v", secretName, err)
 	}
-	return newSE, nil
+	return saToken, nil
 }
 
 func (r *RootPodReconciler) createCAInLeafCluster(ctx context.Context, lr *leafUtils.LeafResource, ns string) (*corev1.ConfigMap, error) {
@@ -496,57 +478,79 @@ func (r *RootPodReconciler) changeToMasterCoreDNS(ctx context.Context, pod *core
 }
 
 func (r *RootPodReconciler) convertAuth(ctx context.Context, lr *leafUtils.LeafResource, pod *corev1.Pod) {
+	// get ExpirationSeconds by AutomountServiceAccountToken
+	var ExpirationSeconds int64
 	if pod.Spec.AutomountServiceAccountToken == nil || *pod.Spec.AutomountServiceAccountToken {
 		falseValue := false
 		pod.Spec.AutomountServiceAccountToken = &falseValue
-
-		sa := pod.Spec.ServiceAccountName
-		_, err := r.createSAInLeafCluster(ctx, lr, sa, pod.Namespace)
-		if err != nil {
-			klog.Errorf("[convertAuth] create sa failed, ns: %s, pod: %s", pod.Namespace, pod.Name)
-			return
-		}
-
-		se, err := r.createSATokenInLeafCluster(ctx, lr, sa, pod.Namespace)
-		if err != nil {
-			klog.Errorf("[convertAuth] create sa secret failed, ns: %s, pod: %s", pod.Namespace, pod.Name)
-			return
-		}
-
-		rootCA, err := r.createCAInLeafCluster(ctx, lr, pod.Namespace)
-		if err != nil {
-			klog.Errorf("[convertAuth] create sa secret failed, ns: %s, pod: %s", pod.Namespace, pod.Name)
-			return
-		}
-
-		volumes := pod.Spec.Volumes
-		for _, v := range volumes {
-			if strings.HasPrefix(v.Name, utils.SATokenPrefix) {
-				sources := []corev1.VolumeProjection{}
-				for _, src := range v.Projected.Sources {
-					if src.ServiceAccountToken != nil {
-						continue
+		ExpirationSeconds = serviceaccount.WarnOnlyBoundTokenExpirationSeconds
+	} else {
+		if pod.Spec.Volumes != nil {
+			for _, volume := range pod.Spec.Volumes {
+				if volume.Projected != nil {
+					for _, projectedVolumeSource := range volume.Projected.Sources {
+						if projectedVolumeSource.ServiceAccountToken != nil {
+							ExpirationSeconds = *projectedVolumeSource.ServiceAccountToken.ExpirationSeconds
+						}
 					}
-					if src.ConfigMap != nil && src.ConfigMap.Name == utils.RooTCAConfigMapName {
-						src.ConfigMap.Name = rootCA.Name
-					}
-					sources = append(sources, src)
 				}
+			}
+		}
+	}
 
-				secretProjection := corev1.VolumeProjection{
-					Secret: &corev1.SecretProjection{
-						Items: []corev1.KeyToPath{
-							{
-								Key:  "token",
-								Path: "token",
-							},
+	sa := pod.Spec.ServiceAccountName
+	_, err := r.createSAInLeafCluster(ctx, lr, sa, pod.Namespace)
+	if err != nil {
+		klog.Errorf("[convertAuth] create sa failed, ns: %s, pod: %s", pod.Namespace, pod.Name)
+		return
+	}
+
+	// bind the token to the pod parameter
+	BoundObjectReference := &authenticationv1.BoundObjectReference{
+		APIVersion: pod.APIVersion,
+		Kind:       pod.Kind,
+		Name:       pod.Name,
+		UID:        pod.UID,
+	}
+	se, err := r.createSATokenInLeafCluster(ctx, lr, sa, pod.Namespace, &ExpirationSeconds, BoundObjectReference)
+	if err != nil {
+		klog.Errorf("[convertAuth] create secret-saToken failed, ns: %s, pod: %s", pod.Namespace, pod.Name)
+		return
+	}
+
+	rootCA, err := r.createCAInLeafCluster(ctx, lr, pod.Namespace)
+	if err != nil {
+		klog.Errorf("[convertAuth] create sa secret failed, ns: %s, pod: %s", pod.Namespace, pod.Name)
+		return
+	}
+
+	volumes := pod.Spec.Volumes
+	for _, v := range volumes {
+		if strings.HasPrefix(v.Name, utils.SATokenPrefix) {
+			sources := []corev1.VolumeProjection{}
+			for _, src := range v.Projected.Sources {
+				if src.ServiceAccountToken != nil {
+					continue
+				}
+				if src.ConfigMap != nil && src.ConfigMap.Name == utils.RooTCAConfigMapName {
+					src.ConfigMap.Name = rootCA.Name
+				}
+				sources = append(sources, src)
+			}
+
+			secretProjection := corev1.VolumeProjection{
+				Secret: &corev1.SecretProjection{
+					Items: []corev1.KeyToPath{
+						{
+							Key:  "token",
+							Path: "token",
 						},
 					},
-				}
-				secretProjection.Secret.Name = se.Name
-				sources = append(sources, secretProjection)
-				v.Projected.Sources = sources
+				},
 			}
+			secretProjection.Secret.Name = se.Name
+			sources = append(sources, secretProjection)
+			v.Projected.Sources = sources
 		}
 	}
 }

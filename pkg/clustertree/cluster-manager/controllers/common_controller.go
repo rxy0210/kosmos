@@ -128,7 +128,7 @@ func (r *SyncResourcesReconciler) SyncResource(ctx context.Context, request reco
 		_, err := lr.DynamicClient.Resource(r.GroupVersionResource).Namespace(request.Namespace).Get(ctx, request.Name, metav1.GetOptions{})
 		if err != nil {
 			if !errors.IsNotFound(err) {
-				klog.Errorf("Get %s from leaef cluster failed, error: %v", obj.GetKind(), err)
+				klog.Errorf("Get %s from leaf cluster failed, error: %v", obj.GetKind(), err)
 				return err
 			}
 			return nil

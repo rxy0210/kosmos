@@ -213,6 +213,13 @@ func run(ctx context.Context, opts *options.Options) error {
 		}
 	}
 
+	podcontrollers.RootPodReconciler{
+		Client:            nil,
+		RootClient:        nil,
+		DynamicRootClient: nil,
+		GlobalLeafManager: nil,
+		Options:           nil,
+	}
 	// init rootPodController
 	rootPodReconciler := podcontrollers.RootPodReconciler{
 		GlobalLeafManager: globalleafManager,
